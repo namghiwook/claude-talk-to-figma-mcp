@@ -40,6 +40,9 @@ export interface ProgressMessage {
 
 // Define possible command types for Figma
 export type FigmaCommand =
+  | "get_geometry"   // ★ 2026-08-07 추가 — 회전 «전» 크기(원본에 없음)
+  | "set_export_settings"   // ★ 2026-08-11 추가 — 에셋 형식·배수는 «디자이너가 정한 것» 이 정본이다
+  | "get_export_settings"   // ★ 2026-08-11 추가
   | "get_document_info"
   | "get_selection"
   | "get_node_info"

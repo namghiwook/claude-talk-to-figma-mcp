@@ -39,3 +39,7 @@ dxt-*/
 
 # Claude Code local settings
 .claude/
+# local backups (git is the backup now)
+*.bak
+*.bak-*
+*.before-*
