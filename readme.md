@@ -2,6 +2,109 @@
 
 # <del>Claude</del> <ins>AI Agents</ins> Talk to Figma MCP
 
+> ## 🍴 This is a fork — here is what differs from upstream
+>
+> Fork of **[arinspunk/claude-talk-to-figma-mcp](https://github.com/arinspunk/claude-talk-to-figma-mcp)**.
+> All credit for the original design and tool catalogue goes there. Everything below the
+> horizontal rule at the end of this box is upstream's README, unchanged.
+>
+> **Why this fork exists.** Our Figma seat is **Dev-mode only** — no Design mode. Upstream's
+> manifest declares `editorType: ["figma", "figjam"]`, so the plugin refuses to start in the dev
+> handoff panel. We also needed node properties the default tools do not expose.
+>
+> ### What we changed
+>
+> | | Change | Why |
+> |---|---|---|
+> | **manifest** | `editorType` += `"dev"`, `capabilities: ["inspect"]` | Without these the plugin cannot run in Dev Mode at all |
+> | **`get_geometry`** *(new)* | Returns **pre-rotation** `width`/`height`, `relativeTransform`, and `rotation` in degrees | `get_node_info` uses `exportAsync({format:"JSON_REST_V1"})`, which is the REST shape — post-rotation AABB only. Measured on a 400×100 text rotated 90°: `exportAsync` → 48×470, `node.width` → **470×48**. CSS `transform: rotate()` needs the latter |
+> | **`set_export_settings`** / **`get_export_settings`** *(new)* | Read and write a node's export format and scale | Asset format/scale is the designer's decision, not something to guess. Across 213 Figma Community files we measured PNG scales of 1, 1.5, 2, 3, 4, 5 **and 21.33**, mixed JPG/SVG/PDF, and constraints such as `HEIGHT 512` rather than a scale. An empty array means *"not decided"* — a meaningful state, not an error |
+> | **`get_node_info({ raw: true })`** *(new flag)* | Enumerates every key actually present in the **unfiltered** `JSON_REST_V1` output | See below |
+>
+> ### Why `raw: true` exists
+>
+> `filterFigmaNode` keeps only `id`, `name`, `type`, `fills`, `strokes`, `cornerRadius`,
+> `absoluteBoundingBox`, `localPosition`, `characters`, `style` and `children`. So
+> `layoutSizing*`, `constraints`, `isMask` and `absoluteRenderBounds` are **invisible even when
+> present** — and concluding *"the source does not provide X"* from filtered output is unsound.
+> We made exactly that mistake once.
+>
+> `raw: true` never returns values (a single screen is megabytes); it returns the key inventory,
+> plus per-node `bbox` / `render` / `isMask` / `rotation` when the subtree has ≤ 30 nodes.
+> It deliberately does **not** use a fixed watch-list: the first version did, omitted `isMask`,
+> and would have been read as *"mask data does not come through"* — which was *"I did not ask"*.
+>
+> ### What we found with it (may be useful to others)
+>
+> `exportAsync({format:"JSON_REST_V1"})` returns essentially the full REST node shape — including
+> `layoutSizing*`, `constraints`, `itemSpacing`, `absoluteRenderBounds`, `isMask`/`maskType`,
+> `strokeWeight`/`strokeAlign`, and gradients with `gradientStops`, alpha and handle positions.
+> What it does **not** return are the `geometry=paths` extras — `size`, `relativeTransform`,
+> `fillGeometry`, `strokeGeometry` — because `ExportSettingsREST` has a single `format` field and
+> no place for a query parameter. Verified against 2,085 nodes (1,026 vectors, 39 rotated).
+>
+> Those gaps are fillable without the REST API: `get_geometry` for the first two, `get_svg` for
+> path data. The bridge for `get_svg` is `absoluteRenderBounds` — the exported viewBox is
+> `ceil(renderBounds.w/h)` and its origin is `renderBounds.x/y`. Masks come through `get_svg` on
+> the **group** as a proper `<mask>` element; note that a mask node's own `absoluteRenderBounds`
+> is `null`, because Figma does not paint it.
+>
+> ### Staying in sync with upstream
+>
+> ```bash
+> git remote add upstream https://github.com/arinspunk/claude-talk-to-figma-mcp.git
+> git fetch upstream && git merge upstream/main
+> bun install && bun run build
+> ```
+>
+> ⚠️ `bun run build` currently fails at the **DTS** step (`src/socket.ts:513`, a pre-existing
+> `Server<WebSocketData>` generics error inherited from upstream). The **JS output is produced
+> correctly** — only the type declarations fail. Do not read it as a broken build.
+>
+> <details>
+> <summary><b>🇰🇷 한국어</b></summary>
+>
+> **왜 포크했나.** 우리 Figma 좌석이 **Dev seat 뿐**이라 Design 모드 권한이 없다. 원본 매니페스트는
+> `editorType: ["figma","figjam"]` 뿐이라 Dev Mode 에서 플러그인이 아예 안 뜬다. 그리고 기본 도구가
+> 안 내주는 노드 속성이 필요했다.
+>
+> **고친 것**
+>
+> | | 무엇 | 왜 |
+> |---|---|---|
+> | **manifest** | `editorType` 에 `"dev"` · `capabilities: ["inspect"]` | 없으면 Dev Mode 에서 실행 자체가 안 된다 |
+> | **`get_geometry`** | **회전 «전»** `width`/`height` · `relativeTransform` · `rotation`(도) | `get_node_info` 는 `exportAsync(JSON_REST_V1)` 라 REST 와 같은 형식 — 회전 «후» AABB 만 준다. 실측(400×100 을 90° 회전): `exportAsync` → 48×470 · `node.width` → **470×48**. CSS `transform: rotate()` 에 필요한 건 뒤엣것이다 |
+> | **`set_export_settings`** / **`get_export_settings`** | 노드의 export 형식·배수를 읽고 쓴다 | 에셋 형식·배수는 **디자이너가 정한 것이 정본**이다(추측 금지). 커뮤니티 213개 실측: PNG 배수가 1·1.5·2·3·4·5·**21.33** 로 제각각, JPG·SVG·PDF 가 섞이고 `HEIGHT 512` 처럼 배수 아닌 제약도 있다. 빈 배열은 **«안 정했다»** — 오류가 아니라 뜻이 있는 상태다 |
+> | **`get_node_info({raw:true})`** | 필터 **«전»** 원본에 «실제로 있는» 키를 전부 열거 | 아래 |
+>
+> **`raw:true` 가 왜 필요한가** — `filterFigmaNode` 가 `id·name·type·fills·strokes·cornerRadius·
+> absoluteBoundingBox·localPosition·characters·style·children` 만 남긴다. 그래서
+> `layoutSizing*`·`constraints`·`isMask`·`absoluteRenderBounds` 는 **있어도 안 보인다.**
+> ⚠️ **필터를 거친 값으로 「원본에 없다」고 판단하면 틀린다** — 실제로 한 번 그렇게 틀렸다.
+>
+> ⚠️ 값은 **안 낸다**(화면 하나가 수 MB). 노드 30개 이하면 `bbox`·`render`·`isMask`·`rotation` 을 값으로 낸다.
+> ⚠️⚠️ **«고정 목록» 으로 세지 않는다** — 첫 판이 그렇게 했다가 **`isMask` 가 빠져** 「마스크 정보가
+> 안 온다」로 읽힐 뻔했다. **「안 온다」가 아니라 「내가 안 물었다」** 였다.
+>
+> **재서 알아낸 것** — `exportAsync(JSON_REST_V1)` 는 REST 노드 형식을 **거의 그대로** 준다:
+> `layoutSizing*`·`constraints`·`itemSpacing`·`absoluteRenderBounds`·`isMask`/`maskType`·
+> `strokeWeight`/`strokeAlign`, 그라디언트도 `gradientStops`·알파·핸들 위치까지.
+> **안 오는 것은 `geometry=paths` 여분**(`size`·`relativeTransform`·`fillGeometry`·`strokeGeometry`)
+> 뿐이다 — `ExportSettingsREST` 에 `format` 필드 하나뿐이라 쿼리 파라미터를 줄 자리가 없다.
+> ✅ 2,085노드(VECTOR 1,026 · 회전 39)로 확인.
+>
+> ★ 그 둘은 REST 없이 메울 수 있다 — 앞은 `get_geometry`, 뒤는 `get_svg`.
+> **다리는 `absoluteRenderBounds`** 다: viewBox 치수 = `ceil(render.w/h)` · 원점 = `render.x/y`.
+> 마스크는 **그룹째** `get_svg` 하면 `<mask>` 로 통째로 온다.
+> ⚠️ 마스크 노드 자신의 `absoluteRenderBounds` 는 **`null`** 이다 — Figma 가 마스크를 안 그리기 때문.
+>
+> ⚠️ `bun run build` 는 **DTS 단계에서 항상 실패**한다(`src/socket.ts:513` — 원본에서 물려받은
+> `Server<WebSocketData>` 제네릭 오류). **JS 는 정상적으로 나온다.** 빌드가 깨진 것으로 읽지 말 것.
+>
+> </details>
+>
+> ---
+
 Enable your AI agents to read, analyze, and modify Figma designs.
 
 Works with your favorite agentic tools:
