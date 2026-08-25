@@ -135,6 +135,34 @@ async function handleCommand(command, params) {
         throw new Error("Missing nodeId parameter");
       }
       return await getNodeInfo(params.nodeId);
+
+    // ★★★ 우리가 더한 명령 — «회전 전» 기하. 원본에는 없다
+    case "get_geometry":
+      if (!params || !params.nodeId) {
+        throw new Error("Missing nodeId parameter");
+      }
+      return await getGeometry(params.nodeId, params.depth);
+    /**
+     * ★★★★ 우리가 더한 명령 — export 설정을 «넣고 읽는다» (2026-08-11). 원본에는 없다
+     *
+     *   ⚠️⚠️ 이것이 없으면 에셋을 «추측해서» 뽑아야 한다. 실측(커뮤니티 213개):
+     *     PNG 배수가 1 · 1.5 · 2 · 3 · 4 · 5 · 21.33 로 제각각이고 JPG · SVG · PDF 가 섞이며
+     *     HEIGHT 512 처럼 배수 아닌 제약도 있다. 붙는 자리도 FRAME · GROUP · VECTOR … 제각각.
+     *   → **디자이너가 정한 것이 정본이다**(design-contract AST-001 · AST-002).
+     *
+     *   ⚠️ Dev Mode(`capabilities:["inspect"]`)는 «읽기 전용» 이라 set 은 실패할 수 있다 —
+     *     그때는 Design 모드에서 실행해야 한다. 실패를 «조용히» 넘기지 않고 그대로 던진다.
+     */
+    case "set_export_settings":
+      if (!params || !params.nodeId) {
+        throw new Error("Missing nodeId parameter");
+      }
+      return await setExportSettings(params.nodeId, params.settings);
+    case "get_export_settings":
+      if (!params || !params.nodeId) {
+        throw new Error("Missing nodeId parameter");
+      }
+      return await getExportSettings(params.nodeId);
     case "get_nodes_info":
       if (!params || !params.nodeIds || !Array.isArray(params.nodeIds)) {
         throw new Error("Missing or invalid nodeIds parameter");
@@ -391,6 +419,103 @@ async function getNodeInfo(nodeId) {
   }
 
   return response.document;
+}
+
+/**
+ * ★★★ get_geometry — **REST 가 «못 주는» 것만 준다** (2026-08-07 추가, 원본에 없음)
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * ⚠️⚠️ 왜 필요한가
+ *   `getNodeInfo` 는 `exportAsync({format:"JSON_REST_V1"})` 를 쓴다 — **REST 와 «같은» 형식**이라
+ *   `absoluteBoundingBox`(회전 «후» AABB)만 나오고 **회전 «전» 크기가 없다.**
+ *
+ *   그래서 회전된 노드를 CSS 로 옮길 수 없었다. `transform: rotate()` 는 «회전 전» 박스를 돌리는데
+ *   우리는 «회전 후» 크기밖에 몰랐다 — 단위만 고쳤더니 213개 중 28개가 나빠졌던 그 문제다.
+ *
+ * ✅ 실측(2026-08-07, 400×100 텍스트를 90° 회전):
+ *     exportAsync(JSON_REST_V1) → 48 × 470   (회전 «후» AABB)
+ *     node.width / node.height  → 470 × 48   (회전 «전» ★ 이것이 필요한 값)
+ *
+ * ★ Plugin API 에는 처음부터 있었다. **플러그인이 «안 내보냈을» 뿐이다.**
+ *
+ * ⚠️ 읽기만 한다 — Dev Mode(`capabilities:["inspect"]`)에서 돌아야 하므로 «쓰기 금지».
+ */
+/**
+ * export 설정을 «읽는다». 빈 배열이면 «디자이너가 안 정했다» 는 뜻 — 오류가 아니다.
+ */
+async function getExportSettings(nodeId) {
+  const node = await getNodeByIdSafe(nodeId);
+  if (!node) {
+    throw new Error("Node not found with ID: " + nodeId);
+  }
+  if (!("exportSettings" in node)) {
+    throw new Error("Node type " + node.type + " does not support export settings");
+  }
+  return { id: node.id, name: node.name, exportSettings: node.exportSettings };
+}
+
+/**
+ * export 설정을 «쓴다».
+ * ⚠️ 빈 배열을 주면 «설정 없음» 으로 지운다 — 그것도 뜻이 있는 상태다.
+ * ⚠️ SVG 에는 constraint 가 없다(배수 개념이 없다) — Figma 가 조용히 무시한다.
+ */
+async function setExportSettings(nodeId, settings) {
+  const node = await getNodeByIdSafe(nodeId);
+  if (!node) {
+    throw new Error("Node not found with ID: " + nodeId);
+  }
+  if (!("exportSettings" in node)) {
+    throw new Error("Node type " + node.type + " does not support export settings");
+  }
+  if (!Array.isArray(settings)) {
+    throw new Error("settings must be an array (use [] to clear)");
+  }
+  var normalized = settings.map(function (s) {
+    if (!s || !s.format) {
+      throw new Error("each setting needs a format (PNG · JPG · SVG · PDF)");
+    }
+    var out = { format: s.format, suffix: s.suffix || "" };
+    if (s.constraint) {
+      out.constraint = { type: s.constraint.type || "SCALE", value: s.constraint.value };
+    }
+    return out;
+  });
+  node.exportSettings = normalized;
+  // ★ 읽어서 돌려준다 — Figma 가 채운 기본값(colorProfile 등)까지 보여 준다
+  return { id: node.id, name: node.name, exportSettings: node.exportSettings };
+}
+
+async function getGeometry(nodeId, depth) {
+  const maxDepth = typeof depth === "number" ? depth : 0;
+
+  const read = (node, d) => {
+    const out = { id: node.id, name: node.name, type: node.type };
+
+    // ★ 회전 «전» 크기 — REST 가 안 주는 바로 그것
+    if ("width" in node) { out.width = node.width; out.height = node.height; }
+    // ★ 회전(라디안이 아니라 «도» 다 — Plugin API 는 degree, REST 는 radian)
+    if ("rotation" in node) out.rotation = node.rotation;
+    // ★ 위치·기울임까지 담은 아핀 행렬. 회전만으로 복원 안 되는 경우의 정본
+    if ("relativeTransform" in node) out.relativeTransform = node.relativeTransform;
+    // 대조용 — 이 값이 REST 의 absoluteBoundingBox 와 같아야 «같은 노드» 임이 확인된다
+    if ("absoluteBoundingBox" in node && node.absoluteBoundingBox) {
+      const b = node.absoluteBoundingBox;
+      out.absoluteBoundingBox = { x: b.x, y: b.y, width: b.width, height: b.height };
+    }
+    if ("x" in node) out.localPosition = { x: node.x, y: node.y };
+
+    if (d < maxDepth && "children" in node && node.children) {
+      out.children = node.children.map((c) => read(c, d + 1));
+    }
+    return out;
+  };
+
+  const node = await getNodeByIdSafe(nodeId);
+  if (!node) throw new Error(`Node not found with ID: ${nodeId}`);
+  return {
+    _note: "width/height 는 «회전 전» 크기다. absoluteBoundingBox 는 «회전 후» AABB 이고 REST 와 같다. rotation 단위는 «도»(REST 는 라디안).",
+    ...read(node, 0),
+  };
 }
 
 async function getNodesInfo(nodeIds) {

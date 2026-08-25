@@ -1,14 +1,17 @@
 {
-  "name": "Claude Talk to Figma Plugin",
-  "id": "claude-mcp-plugin",
+  "name": "Claude Talk to Figma (Dev Mode)",
+  "id": "claude-mcp-plugin-dev",
   "api": "1.0.0",
   "main": "code.js",
   "ui": "ui.html",
   "editorType": [
     "figma",
-    "figjam"
+    "figjam",
+    "dev"
   ],
-  "permissions": ["teamlibrary"],
+  "permissions": [
+    "teamlibrary"
+  ],
   "networkAccess": {
     "allowedDomains": [
       "https://google.com"
@@ -20,5 +23,8 @@
   },
   "documentAccess": "dynamic-page",
   "enableProposedApi": true,
-  "enablePrivatePluginApi": true
+  "enablePrivatePluginApi": true,
+  "capabilities": [
+    "inspect"
+  ]
 }
