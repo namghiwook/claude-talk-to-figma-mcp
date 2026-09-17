@@ -120,6 +120,89 @@ export function registerVariableTools(server: McpServer): void {
     }
   );
 
+  // Add Variable Mode Tool
+  //
+  // Upstream can read, write and switch modes but cannot create one. That left a hole:
+  // dark-theme token work could not start until someone opened the Figma UI and clicked "+",
+  // even though every other step was automated.
+  server.tool(
+    "add_variable_mode",
+    "Add a mode to a variable collection (e.g. a \"Dark\" mode next to \"Light\"). " +
+      "Idempotent: if a mode with that name exists, returns it with created=false. " +
+      "Note: Figma copies the first mode's values into the new mode, and the plan caps how many modes a collection may have.",
+    {
+      name: z.string().describe("Name for the new mode, e.g. \"Dark\""),
+      collectionId: z.string().optional().describe("The ID of the variable collection"),
+      collectionName: z.string().optional().describe("The name of the collection, if you don't have its ID"),
+    },
+    async ({ name, collectionId, collectionName }) => {
+      try {
+        const result = await sendCommandToFigma("add_variable_mode", { name, collectionId, collectionName });
+        const r = result as {
+          collectionName: string; modeId: string; modeName: string;
+          created: boolean; copiedFrom?: string | null;
+          modes: { modeId: string; name: string }[];
+        };
+        const head = r.created
+          ? `Added mode "${r.modeName}" (${r.modeId}) to collection "${r.collectionName}"`
+          : `Mode "${r.modeName}" (${r.modeId}) already existed in collection "${r.collectionName}"`;
+        const copied = r.created && r.copiedFrom
+          ? ` — Figma copied the values from "${r.copiedFrom}", so they are not empty.`
+          : "";
+        const all = ` Modes now: ${r.modes.map((m) => `${m.name} (${m.modeId})`).join(", ")}`;
+        return { content: [{ type: "text", text: head + copied + all }] };
+      } catch (error) {
+        return {
+          content: [{
+            type: "text",
+            text: `Error adding variable mode: ${error instanceof Error ? error.message : String(error)}`,
+          }],
+        };
+      }
+    }
+  );
+
+  // Rename Variable Mode Tool
+  //
+  // Pairs with add_variable_mode: the default mode is called "Mode 1", which reads badly
+  // next to an explicit "Dark".
+  server.tool(
+    "rename_variable_mode",
+    "Rename a mode in a variable collection, e.g. \"Mode 1\" to \"Light\".",
+    {
+      name: z.string().describe("The new mode name"),
+      collectionId: z.string().optional().describe("The ID of the variable collection"),
+      collectionName: z.string().optional().describe("The name of the collection, if you don't have its ID"),
+      modeId: z.string().optional().describe("The ID of the mode to rename"),
+      modeName: z.string().optional().describe("The current name of the mode, if you don't have its ID. Defaults to the first mode."),
+    },
+    async ({ name, collectionId, collectionName, modeId, modeName }) => {
+      try {
+        const result = await sendCommandToFigma("rename_variable_mode", {
+          name, collectionId, collectionName, modeId, modeName,
+        });
+        const r = result as {
+          collectionName: string; from: string; to: string;
+          modes: { modeId: string; name: string }[];
+        };
+        return {
+          content: [{
+            type: "text",
+            text: `Renamed mode "${r.from}" to "${r.to}" in collection "${r.collectionName}". ` +
+              `Modes now: ${r.modes.map((m) => `${m.name} (${m.modeId})`).join(", ")}`,
+          }],
+        };
+      } catch (error) {
+        return {
+          content: [{
+            type: "text",
+            text: `Error renaming variable mode: ${error instanceof Error ? error.message : String(error)}`,
+          }],
+        };
+      }
+    }
+  );
+
   // Switch Variable Mode Tool
   server.tool(
     "switch_variable_mode",

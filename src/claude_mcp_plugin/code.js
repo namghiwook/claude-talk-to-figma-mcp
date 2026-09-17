@@ -328,6 +328,10 @@ async function handleCommand(command, params) {
       return await applyVariableToNode(params);
     case "switch_variable_mode":
       return await switchVariableMode(params);
+    case "add_variable_mode":
+      return await addVariableMode(params);
+    case "rename_variable_mode":
+      return await renameVariableMode(params);
     // ── FigJam commands ──────────────────────────────────────────────────
     case "get_figjam_elements":
       return await getFigJamElements();
@@ -5532,6 +5536,119 @@ async function applyVariableToNode(params) {
 }
 
 // Switch variable mode on a node for a collection
+/**
+ * Add a mode to a variable collection (e.g. a "Dark" mode next to "Light").
+ *
+ * Why this exists: the upstream plugin can read, write and switch modes, but it cannot
+ * *create* one. That left a hole in the pipeline — a designer had to open the Figma UI
+ * and click "+" before any dark-theme token work could start, even though every other
+ * step was automated.
+ *
+ * Notes on limits, so callers are not surprised:
+ *   · Mode count is capped by the Figma plan (Starter allows 1). The API throws; we
+ *     pass that message through rather than swallowing it.
+ *   · A new mode starts as a copy of the collection's first mode. That is Figma's
+ *     behaviour, not ours — we report it so the caller knows the values are not empty.
+ */
+async function addVariableMode(params) {
+  const { collectionId, collectionName, name } = params || {};
+
+  if (!figma.variables) {
+    throw new Error(
+      "Variables API is not available. This feature requires Figma with Variables support."
+    );
+  }
+  if (!name) {
+    throw new Error("Missing name parameter");
+  }
+
+  const collections = await figma.variables.getLocalVariableCollectionsAsync();
+  let collection = null;
+  if (collectionId) {
+    collection = collections.find((c) => c.id === collectionId) || null;
+    if (!collection) throw new Error(`Variable collection not found with ID: ${collectionId}`);
+  } else if (collectionName) {
+    collection = collections.find((c) => c.name === collectionName) || null;
+    if (!collection) throw new Error(`Variable collection not found with name: ${collectionName}`);
+  } else {
+    throw new Error("Missing collectionId or collectionName parameter");
+  }
+
+  const existing = collection.modes.find((m) => m.name === name);
+  if (existing) {
+    // Idempotent: asking twice should not be an error, but say it was already there.
+    return {
+      collectionId: collection.id,
+      collectionName: collection.name,
+      modeId: existing.modeId,
+      modeName: existing.name,
+      created: false,
+      modes: collection.modes.map((m) => ({ modeId: m.modeId, name: m.name })),
+    };
+  }
+
+  let modeId;
+  try {
+    modeId = collection.addMode(name);
+  } catch (e) {
+    // Plan limits surface here (Starter: one mode per collection). Pass it through.
+    throw new Error(
+      `Could not add mode "${name}" to collection "${collection.name}": ${e.message}`
+    );
+  }
+
+  return {
+    collectionId: collection.id,
+    collectionName: collection.name,
+    modeId,
+    modeName: name,
+    created: true,
+    copiedFrom: collection.modes[0] ? collection.modes[0].name : null,
+    modes: collection.modes.map((m) => ({ modeId: m.modeId, name: m.name })),
+  };
+}
+
+/**
+ * Rename a mode. Pairs with add_variable_mode: the default mode is called "Mode 1",
+ * which reads badly next to an explicit "Dark", so callers usually want to rename it.
+ */
+async function renameVariableMode(params) {
+  const { collectionId, collectionName, modeId, modeName, name } = params || {};
+
+  if (!figma.variables) {
+    throw new Error(
+      "Variables API is not available. This feature requires Figma with Variables support."
+    );
+  }
+  if (!name) {
+    throw new Error("Missing name parameter (the new mode name)");
+  }
+
+  const collections = await figma.variables.getLocalVariableCollectionsAsync();
+  let collection = null;
+  if (collectionId) collection = collections.find((c) => c.id === collectionId) || null;
+  else if (collectionName) collection = collections.find((c) => c.name === collectionName) || null;
+  else throw new Error("Missing collectionId or collectionName parameter");
+  if (!collection) throw new Error("Variable collection not found");
+
+  let mode = null;
+  if (modeId) mode = collection.modes.find((m) => m.modeId === modeId) || null;
+  else if (modeName) mode = collection.modes.find((m) => m.name === modeName) || null;
+  else mode = collection.modes[0] || null;
+  if (!mode) throw new Error("Mode not found in that collection");
+
+  collection.renameMode(mode.modeId, name);
+
+  return {
+    collectionId: collection.id,
+    collectionName: collection.name,
+    modeId: mode.modeId,
+    from: mode.name,
+    to: name,
+    modes: collection.modes.map((m) => ({ modeId: m.modeId, name: m.name })),
+  };
+}
+
 async function switchVariableMode(params) {
   const { nodeId, collectionId, modeId } = params || {};
 
