@@ -259,6 +259,9 @@ async function handleCommand(command, params) {
       return await createLine(params);
     case "create_component_from_node":
       return await createComponentFromNode(params);
+    // ★ 되풀이 컴포넌트화의 «마지막 한 걸음» — 기본이 마른 연습이다(아래 함수 머리말)
+    case "replace_with_instance":
+      return await replaceWithInstance(params);
     case "create_component_set":
       return await createComponentSet(params);
     case "set_instance_variant":
@@ -6476,3 +6479,246 @@ async function createEffectStyle(params) {
   };
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+/**
+ * ★★★★★ 한 자리를 «컴포넌트 인스턴스로 갈아치운다» (2026-11-24)
+ *
+ *   되풀이 컴포넌트화의 «마지막 한 걸음» 이다. 전에는 낱개 넷을 이어야 했다 —
+ *   인스턴스 만들기 → 그 부모의 그 index 에 넣기 → 텍스트 오버라이드 → 원본 삭제.
+ *   자리마다 왕복 넷이고, 중간에 끊기면 «반쯤 고쳐진 파일» 이 남는다.
+ *
+ * ⚠️⚠️ 이 명령은 «노드를 지운다». 그래서 규율 넷을 박아 뒀다:
+ *   ① **기본이 «마른 연습»(`dryRun`) 이다** — 바꾸려면 `dryRun: false` 를 «명시» 해야 한다.
+ *      그리고 마른 연습도 «조용하지» 않다 — `applied: false` 를 또렷이 돌려준다
+ *      (안 했는데 했다고 읽히면 그게 조용한 거짓말이다).
+ *   ② **글꼴을 손대기 «전» 에 다 불러온다** — 실패하면 «아무것도 바꾸지 않고» 멈춘다.
+ *      반쯤 고쳐진 파일보다 안 고쳐진 파일이 낫다.
+ *   ③ **`figma.commitUndo()` 로 앞뒤를 묶는다** — Cmd+Z «한 번» 으로 되돌아간다.
+ *      (소스 전체에 `commitUndo` 가 0건이었다 — 그래서 300군데를 갈면 Cmd+Z 를 수백 번 눌러야 했다.)
+ *   ④ **못 옮긴 것을 «세어서» 돌려준다**(`notCopied`·`warnings`) — 조용히 빠뜨리지 않는다.
+ *
+ * ⚠️ 옮기는 오버라이드는 «텍스트뿐» 이다. 색·이미지·가시성·변형 선택은 안 옮긴다.
+ *   지문이 「색까지 같다」고 보증한 것은 `L0` 뿐이고, 그 보증을 코드가 알 길이 없다.
+ *
+ * ⚠️ **텍스트 짝짓기는 «순서» 로 한다 — 그것은 «가정» 이다.** 지문이 구조가 같다고 했으니
+ *   대개 맞지만, 레이어 이름이 다르면 `warnings` 에 적어 사람이 보게 한다.
+ */
+function cttfCollectTexts(node, out, path) {
+  out = out || [];
+  path = path || [];
+  if (node.type === "TEXT") {
+    out.push({
+      node: node, id: node.id, name: node.name,
+      chars: node.characters, path: path.join("/") || node.name
+    });
+  }
+  var kids = ("children" in node) ? node.children : [];
+  for (var i = 0; i < kids.length; i++) {
+    cttfCollectTexts(kids[i], out, path.concat(kids[i].name || kids[i].type));
+  }
+  return out;
+}
+
+/** 손대기 «전» 에 글꼴을 다 불러온다. 바꾸는 것은 «없다» — 그래서 마른 연습에서도 돈다. */
+async function cttfLoadFontsFor(textNodes) {
+  var seen = {}, failed = [];
+  for (var i = 0; i < textNodes.length; i++) {
+    var tn = textNodes[i].node, list = [];
+    try {
+      if (tn.fontName === figma.mixed) {
+        var segs = tn.getStyledTextSegments(["fontName"]);
+        for (var s = 0; s < segs.length; s++) list.push(segs[s].fontName);
+      } else {
+        list.push(tn.fontName);
+      }
+    } catch (e) { failed.push("(글꼴을 못 읽었다: " + textNodes[i].path + ")"); continue; }
+    for (var j = 0; j < list.length; j++) {
+      var f = list[j], k = f.family + "::" + f.style;
+      if (seen[k]) continue;
+      seen[k] = true;
+      try { await figma.loadFontAsync(f); } catch (e) { failed.push(k); }
+    }
+  }
+  return { loaded: Object.keys(seen), failed: failed };
+}
+
+async function replaceWithInstance(params) {
+  var p = params || {};
+  var nodeId = p.nodeId;
+  var dryRun = p.dryRun !== false;          // ★ 기본 true — 바꾸려면 명시해야 한다
+  var copyText = p.copyText !== false;
+  var keepName = p.keepName === true;
+  var groupUndo = p.groupUndo !== false;
+
+  if (!nodeId) throw new Error("Missing nodeId parameter");
+  if (!p.componentId && !p.componentKey) {
+    throw new Error("componentId 나 componentKey 중 하나는 있어야 한다");
+  }
+
+  var node = await getNodeByIdSafe(nodeId);
+  if (!node) throw new Error("Node not found with ID: " + nodeId);
+  if (node.type === "COMPONENT" || node.type === "COMPONENT_SET") {
+    throw new Error("컴포넌트 «정의» 는 갈아치우지 않는다 (" + node.type + ") — 정의가 곧 원본이다");
+  }
+  var parent = node.parent;
+  if (!parent || !("insertChild" in parent)) {
+    throw new Error("부모가 자식을 받지 못한다 — 갈아치울 «자리» 가 없다: " + (parent ? parent.type : "(부모 없음)"));
+  }
+
+  // ── 컴포넌트 찾기
+  var component = null;
+  if (p.componentId) {
+    component = await getNodeByIdSafe(p.componentId);
+    if (!component) throw new Error("Component not found with ID: " + p.componentId);
+  } else {
+    try {
+      component = await figma.importComponentByKeyAsync(p.componentKey);
+    } catch (e) {
+      throw new Error("componentKey 로 못 찾았다(" + p.componentKey + ") — 아직 publish 안 된 로컬 컴포넌트면 «componentId» 를 쓸 것: " + (e && e.message || e));
+    }
+  }
+  var target = component;
+  if (component.type === "COMPONENT_SET") {
+    target = component.defaultVariant;
+    if (!target) throw new Error("COMPONENT_SET 인데 defaultVariant 가 없다 — 어느 변형인지 정해 줄 것");
+  }
+  if (target.type !== "COMPONENT") {
+    throw new Error("컴포넌트가 아니다: " + target.type);
+  }
+
+  // ── 자리를 적어 둔다 (되돌릴 때 사람이 읽을 것이기도 하다)
+  var index = parent.children.indexOf(node);
+  var autoLayoutParent = ("layoutMode" in parent) && !!parent.layoutMode && parent.layoutMode !== "NONE";
+  var before = {
+    id: node.id, name: node.name, type: node.type,
+    parent: { id: parent.id, name: parent.name, type: parent.type,
+              layoutMode: ("layoutMode" in parent) ? (parent.layoutMode || "NONE") : "NONE" },
+    index: index,
+    box: { x: node.x, y: node.y, width: node.width, height: node.height },
+    layout: {},
+    constraints: ("constraints" in node) ? node.constraints : null,
+    visible: node.visible, locked: node.locked
+  };
+  ["layoutAlign", "layoutGrow", "layoutPositioning", "layoutSizingHorizontal", "layoutSizingVertical"]
+    .forEach(function (k) { if (k in node) before.layout[k] = node[k]; });
+
+  var warnings = [];
+  var notCopied = ["색(fills·strokes) 오버라이드", "이미지", "가시성(visible)", "변형(variant) 선택", "효과(effects)"];
+
+  // ── 텍스트 짝짓기 + 글꼴 먼저 불러오기 (★ 바꾸기 «전» 에 실패하게)
+  var srcTexts = cttfCollectTexts(node);
+  var compTexts = cttfCollectTexts(target);
+  var pairs = [], n = Math.min(srcTexts.length, compTexts.length), nameMismatch = 0;
+  for (var i = 0; i < n; i++) {
+    var same = srcTexts[i].name === compTexts[i].name;
+    if (!same) nameMismatch++;
+    pairs.push({
+      from: srcTexts[i].path, to: compTexts[i].path,
+      text: srcTexts[i].chars, willChange: srcTexts[i].chars !== compTexts[i].chars, nameMatch: same
+    });
+  }
+  if (srcTexts.length !== compTexts.length) {
+    warnings.push("텍스트 노드 수가 다르다 — 원본 " + srcTexts.length + " · 컴포넌트 " + compTexts.length +
+      " ⇒ 짝지은 것은 " + n + "개뿐이고 나머지는 «안 옮긴다»");
+  }
+  if (nameMismatch) {
+    warnings.push("짝지은 " + nameMismatch + "쌍의 레이어 이름이 다르다 — 순서로 짝지었다(«가정» 이다). textPairs 를 눈으로 볼 것");
+  }
+
+  var fontCheck = { loaded: [], failed: [] };
+  if (copyText && n > 0) {
+    fontCheck = await cttfLoadFontsFor(compTexts);
+    if (fontCheck.failed.length) {
+      warnings.push("글꼴 " + fontCheck.failed.length + "개를 못 불러왔다: " + fontCheck.failed.join(" · ") +
+        " ⇒ 🚫 «아무것도 바꾸지 않았다». 글꼴을 열 수 있게 한 뒤 다시 돌릴 것");
+    }
+  }
+  var fontBlocked = copyText && fontCheck.failed.length > 0;
+
+  var report = {
+    before: before,
+    component: { id: target.id, name: target.name, key: target.key,
+                 fromSet: component.type === "COMPONENT_SET" ? component.id : null },
+    textPairs: pairs, fonts: fontCheck, warnings: warnings, notCopied: notCopied
+  };
+
+  // ── ① 마른 연습이 기본이다
+  if (dryRun) {
+    report.applied = false;
+    report.dryRun = true;
+    report.hint = "실제로 바꾸려면 dryRun: false 를 «명시» 하십시오. 이번에는 파일을 건드리지 않았습니다";
+    return report;
+  }
+  // ── ② 글꼴이 막히면 «손대지 않고» 멈춘다
+  if (fontBlocked) {
+    report.applied = false;
+    report.dryRun = false;
+    report.stoppedBefore = "글꼴을 못 불러와 멈췄다 — 반쯤 고쳐진 파일을 남기지 않는다";
+    return report;
+  }
+
+  // ── ③ 되돌리기 묶음 열기
+  if (groupUndo && typeof figma.commitUndo === "function") figma.commitUndo();
+
+  var did = { reparented: false, positioned: false, resized: false, layoutCopied: [],
+              textsSet: 0, textsSkipped: 0, textsFailed: [], undoGrouped: false, selected: false };
+
+  var instance = target.createInstance();
+  parent.insertChild(index, instance);
+  did.reparented = true;
+
+  if (!autoLayoutParent) {
+    try { instance.x = before.box.x; instance.y = before.box.y; did.positioned = true; } catch (e) {}
+    if (before.constraints && "constraints" in instance) {
+      try { instance.constraints = before.constraints; did.layoutCopied.push("constraints"); } catch (e) {}
+    }
+    // ⚠️ 절대좌표 자리에서는 «크기가 자리의 일부» 다. 오토레이아웃 안이면 레이아웃이 정하게 둔다
+    if (before.box.width && before.box.height &&
+        (Math.round(instance.width) !== Math.round(before.box.width) ||
+         Math.round(instance.height) !== Math.round(before.box.height))) {
+      try { instance.resize(before.box.width, before.box.height); did.resized = true; }
+      catch (e) {
+        warnings.push("크기를 못 맞췄다(" + before.box.width + "×" + before.box.height + ") — " + (e && e.message || e));
+      }
+    }
+  } else {
+    warnings.push("부모가 오토레이아웃(" + before.parent.layoutMode + ") 이라 «크기를 맞추지 않았다» — 레이아웃이 정한다");
+  }
+
+  Object.keys(before.layout).forEach(function (k) {
+    if (!(k in instance)) return;
+    try { instance[k] = before.layout[k]; did.layoutCopied.push(k); } catch (e) {}
+  });
+  if (keepName) { try { instance.name = before.name; } catch (e) {} }
+  if (before.visible === false) { try { instance.visible = false; did.layoutCopied.push("visible"); } catch (e) {} }
+
+  // ── 텍스트 오버라이드
+  if (copyText && n > 0) {
+    var instTexts = cttfCollectTexts(instance);
+    var m = Math.min(srcTexts.length, instTexts.length);
+    for (var t = 0; t < m; t++) {
+      if (srcTexts[t].chars === instTexts[t].chars) { did.textsSkipped++; continue; }
+      try { await setCharacters(instTexts[t].node, srcTexts[t].chars); did.textsSet++; }
+      catch (e) { did.textsFailed.push({ path: instTexts[t].path, error: String(e && e.message || e) }); }
+    }
+    if (instTexts.length !== compTexts.length) {
+      warnings.push("인스턴스의 텍스트 수(" + instTexts.length + ")가 컴포넌트(" + compTexts.length + ")와 다르다 — 중첩 인스턴스일 수 있다");
+    }
+  }
+
+  var removedId = node.id, removedName = node.name;
+  node.remove();
+
+  if (groupUndo && typeof figma.commitUndo === "function") { figma.commitUndo(); did.undoGrouped = true; }
+  try { figma.currentPage.selection = [instance]; did.selected = true; } catch (e) {}
+
+  report.applied = true;
+  report.dryRun = false;
+  report.instanceId = instance.id;
+  report.instanceName = instance.name;
+  report.removed = { id: removedId, name: removedName };
+  report.did = did;
+  report.warnings = warnings;
+  return report;
+}

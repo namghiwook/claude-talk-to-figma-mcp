@@ -91,6 +91,7 @@ export type FigmaCommand =
   | "flatten_node"
   | "insert_child"
   | "create_component_from_node"
+  | "replace_with_instance"
   | "create_component_set"
   | "set_instance_variant"
   | "create_page"
