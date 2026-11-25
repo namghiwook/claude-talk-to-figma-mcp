@@ -6552,8 +6552,15 @@ async function cttfLoadFontsFor(textNodes) {
 function cttfCollectAll(node, out, path) {
   out = out || [];
   path = path || [];
-  var key = path.join('/') || (node.name || node.type);
-  out.push({ node: node, path: key, type: node.type, name: node.name });
+  /**
+   * ★★ 뿌리 경로는 **늘 `''` 로 붙박이다** (2026-11-25 실물에서 걸렸다).
+   *   전에는 뿌리 경로도 «레이어 이름» 이었다. 그러면 자리 이름(「알림 배지」)과
+   *   컴포넌트 이름(「Badge」)이 다를 때 **바탕색이 짝을 아예 못 찾는다.**
+   *   자식 경로는 빈 배열이 아니니 `''` 와 겹치지 않는다(이름이 빈 노드는 type 으로 대신한다).
+   */
+  var isRoot = path.length === 0;
+  var key = isRoot ? '' : path.join('/');
+  out.push({ node: node, path: key, type: node.type, name: node.name, isRoot: isRoot });
   var kids = ('children' in node) ? node.children : [];
   for (var i = 0; i < kids.length; i++) {
     cttfCollectAll(kids[i], out, path.concat(kids[i].name || kids[i].type));
@@ -6638,12 +6645,23 @@ function cttfPlanReplace(node, target) {
   var srcAll = cttfCollectAll(node);
   var compByPath = {};
   cttfCollectAll(target).forEach(function (e) { if (!(e.path in compByPath)) compByPath[e.path] = e; });
-  var fillDiffs = [], fillUnmatched = 0;
+  var fillDiffs = [], fillUnmatched = [];
   srcAll.forEach(function (e) {
     if (!('fills' in e.node)) return;
     var m = compByPath[e.path];
-    if (!m || m.type !== e.type || !('fills' in m.node)) { fillUnmatched++; return; }
-    if (!cttfSamePaints(e.node.fills, m.node.fills)) fillDiffs.push({ path: e.path, type: e.type });
+    /**
+     * ★★★ **뿌리에선 타입을 견주지 않는다.**
+     *   자리는 FRAME/GROUP 이고 컴포넌트는 COMPONENT 다 ⇒ 견주면 «언제나» 안 맞아서
+     *   **카드 바탕색(가장 흔히 덮어쓰는 그 색)이 「색다름」에 영원히 안 들어갔다.**
+     *   2026-11-25 ds-test 에서 재서 알았다 — 두 곳을 바꿨는데 「색다름 1」이었다.
+     *   자식은 그대로 견준다 — TEXT 의 fill 을 FRAME 에 칠하면 진짜로 틀리기 때문이다.
+     */
+    if (!m || !('fills' in m.node) || (!e.isRoot && m.type !== e.type)) {
+      fillUnmatched.push(e.path || '(뿌리)'); return;
+    }
+    if (!cttfSamePaints(e.node.fills, m.node.fills)) {
+      fillDiffs.push({ path: e.path, label: e.path || '(뿌리)', type: e.type });
+    }
   });
 
   return { node: node, target: target, parent: parent, index: index,
@@ -6709,9 +6727,9 @@ async function cttfApplyReplace(plan, opts) {
       var dst = instByPath[d.path];
       var from = null;
       cttfCollectAll(node).some(function (e) { if (e.path === d.path) { from = e; return true; } return false; });
-      if (!dst || !from || !('fills' in dst.node)) { did.fillsFailed.push({ path: d.path, error: '인스턴스에서 짝을 못 찾았다' }); return; }
+      if (!dst || !from || !('fills' in dst.node)) { did.fillsFailed.push({ path: d.label, error: '인스턴스에서 짝을 못 찾았다' }); return; }
       try { dst.node.fills = from.node.fills; did.fillsSet++; }
-      catch (e) { did.fillsFailed.push({ path: d.path, error: String(e && e.message || e) }); }
+      catch (e) { did.fillsFailed.push({ path: d.label, error: String(e && e.message || e) }); }
     });
   }
 
@@ -6796,7 +6814,10 @@ async function replaceWithInstance(params) {
     plans.push(plan);
     sites.push({ nodeId: id, name: node.name, ok: true, before: plan.before,
       textPairs: plan.pairs, fillsDiffer: plan.fillDiffs.length,
-      fillPathsUnmatched: plan.fillUnmatched, warnings: plan.warnings });
+      // ★ 수만 내면 「그게 뜻이 있는 다름인가」를 사람이 판단할 수 없다 ⇒ 경로도 낸다
+      fillDiffPaths: plan.fillDiffs.slice(0, 8).map(function (d) { return d.label; }),
+      fillPathsUnmatched: plan.fillUnmatched.length,
+      fillUnmatchedPaths: plan.fillUnmatched.slice(0, 8), warnings: plan.warnings });
   }
 
   // ── ② 글꼴을 «먼저» 다 불러온다. 자리가 몇이든 컴포넌트는 하나라 한 번이면 된다
