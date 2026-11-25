@@ -425,7 +425,50 @@ async function getNodeInfo(nodeId) {
     };
   }
 
+  await cttfFillComponentKeys(response.document);
+
   return response.document;
+}
+
+/**
+ * ★★★★★ **INSTANCE 에 `componentKey` 를 채운다** (2026-11-25 · ①→④ 를 돌려서 걸렸다)
+ *
+ *   ⚠️⚠️ `exportAsync({format:"JSON_REST_V1"})` 는 인스턴스에 **`componentId`(노드 id)만** 싣는다.
+ *   REST 의 `componentKey` 는 파일 «전체» 응답의 `components` 카탈로그에서 오는데,
+ *   노드 하나만 내보내면 **그 카탈로그가 없다.**
+ *   ⇒ 읽는 쪽(`ossp/tools/unmapped-report.mjs`)은
+ *     `n.componentKey || cat.components[n.componentId].key` 를 보므로 **열쇠가 늘 `null`** 이었고,
+ *   `figma-component-key` 관측이 **0건**이었다 — **「컴포넌트가 하나도 없다」로 읽힌다.**
+ *
+ * ★ `componentId` 를 «구별해» 한 번씩만 푼다 — 인스턴스 300개라도 컴포넌트는 몇 개다.
+ * ★★ 라이브러리(원격) 컴포넌트도 `getNodeByIdAsync` 로 풀린다 —
+ *    `get_local_components` 로 만든 카탈로그가 «로컬만» 이었던 한계를 이쪽이 덮는다.
+ * ⚠️ **못 풀면 칸을 «안 만든다»** — `null` 을 넣으면 「열쇠가 없다」로 읽힌다(§1-③).
+ *    읽는 쪽이 못 푼 수를 세고 있다(`cttf-collect` 의 「열쇠를 못 푼 것 N개」).
+ */
+async function cttfFillComponentKeys(doc) {
+  const want = new Set();
+  (function scan(n) {
+    if (!n || typeof n !== "object") return;
+    if (n.type === "INSTANCE" && n.componentId) want.add(n.componentId);
+    for (const c of (n.children || [])) scan(c);
+  })(doc);
+  if (!want.size) return;
+
+  const keyOf = new Map();
+  for (const id of want) {
+    try {
+      const comp = await figma.getNodeByIdAsync(id);
+      if (comp && comp.key) keyOf.set(id, comp.key);
+    } catch (e) { /* 못 풀면 칸을 안 만든다 — 조용히 null 을 넣지 않는다 */ }
+  }
+  if (!keyOf.size) return;
+
+  (function paint(n) {
+    if (!n || typeof n !== "object") return;
+    if (n.type === "INSTANCE" && keyOf.has(n.componentId)) n.componentKey = keyOf.get(n.componentId);
+    for (const c of (n.children || [])) paint(c);
+  })(doc);
 }
 
 /**
@@ -3915,6 +3958,26 @@ async function createComponentFromNode(params) {
     };
   }
 
+  /**
+   * ★★★★ **만들기 «전에» 막는다** (2026-11-25 실측)
+   *
+   *   ⚠️⚠️ 전에는 조상을 안 봤다. 그래서 컴포넌트 «안» 의 노드를 컴포넌트화하면
+   *   ① `figma.createComponent()` 로 만들고 ② 페이지에 붙이고 ③ `parent.insertChild` 에서
+   *   **터졌다**(`Reparenting would create a component inside a component`).
+   *   ⇒ **①② 를 되돌리지 않아** `Component` 라는 찌꺼기가 페이지에 남았고,
+   *   그것이 **원본의 «지역» 좌표(x10 y7.5)로 캔버스 원점에 얹혀** 실제 화면과 겹쳤다.
+   *   (ds-test 에서 훑기가 「3화면」이어야 하는데 **4화면**으로 나와 걸렸다.)
+   *
+   *   ★ 실패를 «예측할 수 있으면» 아무것도 만들지 않는다 — 되돌리기보다 싸고 확실하다.
+   */
+  for (var anc = node.parent; anc; anc = anc.parent) {
+    if (anc.type === "COMPONENT" || anc.type === "COMPONENT_SET" || anc.type === "INSTANCE") {
+      throw new Error('조상이 ' + anc.type + ' 이라 컴포넌트로 만들 수 없다'
+        + ' (Figma 가 컴포넌트 안의 컴포넌트를 금지한다) — 먼저 그 노드를 꺼내십시오: '
+        + anc.id + ' "' + anc.name + '". ★ 아무것도 만들지 않았다(찌꺼기 없음)');
+    }
+  }
+
   let component;
 
   // For frames, groups, and other container nodes, we can use createComponentFromNode
@@ -3956,15 +4019,18 @@ async function createComponentFromNode(params) {
       }
       component.appendChild(clone);
 
-      // Add component to the same parent at the same position
-      if (parent && "insertChild" in parent) {
-        parent.insertChild(index, component);
-      } else {
-        figma.currentPage.appendChild(component);
+      // ★ 위 검사로 막히는 것이 «알려진» 실패다. 모르는 실패에도 찌꺼기를 남기지 않는다
+      try {
+        if (parent && "insertChild" in parent) {
+          parent.insertChild(index, component);
+        } else {
+          figma.currentPage.appendChild(component);
+        }
+        node.remove();                  // ★ 성공한 «뒤에» 지운다 — 원본이 마지막 보험이다
+      } catch (err) {
+        try { component.remove(); } catch (e2) { /* 지우다 터져도 원래 오류를 전한다 */ }
+        throw err;
       }
-
-      // Remove the original node
-      node.remove();
     } else if (node.type === "FRAME" || node.type === "GROUP") {
       // Fallback for frames/groups if createComponentFromNode is not available
       component = figma.createComponent();
@@ -3991,15 +4057,22 @@ async function createComponentFromNode(params) {
         component.cornerRadius = node.cornerRadius;
       }
 
-      // Add component to the same parent
-      if (parent && "insertChild" in parent) {
-        parent.insertChild(index, component);
-      } else {
-        figma.currentPage.appendChild(component);
+      // ★ 이 갈래는 자식을 «이미» 컴포넌트로 옮겼다 ⇒ 되돌릴 때 «돌려놓고» 거둬야 한다.
+      //   그냥 component.remove() 하면 **자식이 같이 지워진다.**
+      try {
+        if (parent && "insertChild" in parent) {
+          parent.insertChild(index, component);
+        } else {
+          figma.currentPage.appendChild(component);
+        }
+        node.remove();
+      } catch (err) {
+        try {
+          for (const child of [...component.children]) node.appendChild(child);
+          component.remove();
+        } catch (e2) { /* 되돌리다 터져도 원래 오류를 전한다 */ }
+        throw err;
       }
-
-      // Remove the original node
-      node.remove();
     } else {
       throw new Error(`Cannot create component from node type: ${node.type}`);
     }
