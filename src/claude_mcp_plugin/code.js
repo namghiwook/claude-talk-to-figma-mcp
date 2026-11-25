@@ -6543,182 +6543,336 @@ async function cttfLoadFontsFor(textNodes) {
   return { loaded: Object.keys(seen), failed: failed };
 }
 
-async function replaceWithInstance(params) {
-  var p = params || {};
-  var nodeId = p.nodeId;
-  var dryRun = p.dryRun !== false;          // ★ 기본 true — 바꾸려면 명시해야 한다
-  var copyText = p.copyText !== false;
-  var keepName = p.keepName === true;
-  var groupUndo = p.groupUndo !== false;
 
-  if (!nodeId) throw new Error("Missing nodeId parameter");
-  if (!p.componentId && !p.componentKey) {
-    throw new Error("componentId 나 componentKey 중 하나는 있어야 한다");
+/**
+ * ★ 모든 노드를 문서 순서로 — «색» 짝짓기용. 경로(`path`)로 맞춘다.
+ *   ⚠️ 텍스트는 «순서» 로 맞추는데 색은 «경로» 로 맞춘다 — 까닭이 다르다.
+ *   텍스트는 수가 적고 빠지면 바로 눈에 띄지만, 색은 수십 군데라 **한 칸 밀리면 엉뚱한 노드를 칠한다.**
+ */
+function cttfCollectAll(node, out, path) {
+  out = out || [];
+  path = path || [];
+  var key = path.join('/') || (node.name || node.type);
+  out.push({ node: node, path: key, type: node.type, name: node.name });
+  var kids = ('children' in node) ? node.children : [];
+  for (var i = 0; i < kids.length; i++) {
+    cttfCollectAll(kids[i], out, path.concat(kids[i].name || kids[i].type));
   }
+  return out;
+}
 
-  var node = await getNodeByIdSafe(nodeId);
-  if (!node) throw new Error("Node not found with ID: " + nodeId);
-  if (node.type === "COMPONENT" || node.type === "COMPONENT_SET") {
-    throw new Error("컴포넌트 «정의» 는 갈아치우지 않는다 (" + node.type + ") — 정의가 곧 원본이다");
-  }
-  var parent = node.parent;
-  if (!parent || !("insertChild" in parent)) {
-    throw new Error("부모가 자식을 받지 못한다 — 갈아치울 «자리» 가 없다: " + (parent ? parent.type : "(부모 없음)"));
-  }
-
-  // ── 컴포넌트 찾기
-  var component = null;
-  if (p.componentId) {
-    component = await getNodeByIdSafe(p.componentId);
-    if (!component) throw new Error("Component not found with ID: " + p.componentId);
-  } else {
-    try {
-      component = await figma.importComponentByKeyAsync(p.componentKey);
-    } catch (e) {
-      throw new Error("componentKey 로 못 찾았다(" + p.componentKey + ") — 아직 publish 안 된 로컬 컴포넌트면 «componentId» 를 쓸 것: " + (e && e.message || e));
+/** 두 paint 목록이 «뜻이 같은가». 노드마다 객체가 새로 오므로 값으로 견준다. */
+function cttfSamePaints(a, b) {
+  if (a === b) return true;
+  if (a === figma.mixed || b === figma.mixed) return a === b;
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+  for (var i = 0; i < a.length; i++) {
+    var x = a[i], y = b[i];
+    if (x.type !== y.type || x.visible !== y.visible) return false;
+    if (Math.abs((x.opacity === undefined ? 1 : x.opacity) - (y.opacity === undefined ? 1 : y.opacity)) > 1e-6) return false;
+    if (x.type === 'SOLID') {
+      if (Math.abs(x.color.r - y.color.r) > 1e-6 || Math.abs(x.color.g - y.color.g) > 1e-6
+        || Math.abs(x.color.b - y.color.b) > 1e-6) return false;
+    } else {
+      // 그라디언트·이미지는 «같다» 고 단정하지 않는다 — 모르는 것을 같다고 하면 조용히 안 옮긴다
+      return false;
     }
   }
-  var target = component;
-  if (component.type === "COMPONENT_SET") {
-    target = component.defaultVariant;
-    if (!target) throw new Error("COMPONENT_SET 인데 defaultVariant 가 없다 — 어느 변형인지 정해 줄 것");
-  }
-  if (target.type !== "COMPONENT") {
-    throw new Error("컴포넌트가 아니다: " + target.type);
-  }
+  return true;
+}
 
-  // ── 자리를 적어 둔다 (되돌릴 때 사람이 읽을 것이기도 하다)
+/**
+ * ★★ 한 자리의 «계획» 을 낸다 — **바꾸지 않는다.**
+ *   마른 연습과 실제 적용이 **같은 계획**을 쓰게 하려고 뗐다(§1-① — 두 벌로 짜면 반드시 갈린다).
+ */
+function cttfPlanReplace(node, target) {
+  var parent = node.parent;
   var index = parent.children.indexOf(node);
-  var autoLayoutParent = ("layoutMode" in parent) && !!parent.layoutMode && parent.layoutMode !== "NONE";
+  var autoLayoutParent = ('layoutMode' in parent) && !!parent.layoutMode && parent.layoutMode !== 'NONE';
   var before = {
     id: node.id, name: node.name, type: node.type,
     parent: { id: parent.id, name: parent.name, type: parent.type,
-              layoutMode: ("layoutMode" in parent) ? (parent.layoutMode || "NONE") : "NONE" },
+              layoutMode: ('layoutMode' in parent) ? (parent.layoutMode || 'NONE') : 'NONE' },
     index: index,
     box: { x: node.x, y: node.y, width: node.width, height: node.height },
     layout: {},
-    constraints: ("constraints" in node) ? node.constraints : null,
+    constraints: ('constraints' in node) ? node.constraints : null,
     visible: node.visible, locked: node.locked
   };
-  ["layoutAlign", "layoutGrow", "layoutPositioning", "layoutSizingHorizontal", "layoutSizingVertical"]
+  ['layoutAlign', 'layoutGrow', 'layoutPositioning', 'layoutSizingHorizontal', 'layoutSizingVertical']
     .forEach(function (k) { if (k in node) before.layout[k] = node[k]; });
 
   var warnings = [];
-  var notCopied = ["색(fills·strokes) 오버라이드", "이미지", "가시성(visible)", "변형(variant) 선택", "효과(effects)"];
+  /**
+   * ⚠️⚠️ **부모가 `GROUP` 이면 적어 둔다.** 그룹의 경계는 **자식에서 파생**되므로
+   *   넣고 빼는 사이에 그룹 크기가 달라질 수 있다. ★ 그래서 순서가 **«넣고 나서» 뺀다** 다 —
+   *   거꾸로 하면 자식이 하나뿐인 그룹은 Figma 가 **그룹째 지운다.**
+   */
+  if (parent.type === 'GROUP') {
+    warnings.push('부모가 GROUP 이다 — 경계가 자식에서 파생되므로 그룹 크기가 달라질 수 있다 '
+      + '(★ 넣고 «나서» 빼므로 자식 0개가 되는 일은 없다)');
+  }
 
-  // ── 텍스트 짝짓기 + 글꼴 먼저 불러오기 (★ 바꾸기 «전» 에 실패하게)
   var srcTexts = cttfCollectTexts(node);
   var compTexts = cttfCollectTexts(target);
   var pairs = [], n = Math.min(srcTexts.length, compTexts.length), nameMismatch = 0;
   for (var i = 0; i < n; i++) {
     var same = srcTexts[i].name === compTexts[i].name;
     if (!same) nameMismatch++;
-    pairs.push({
-      from: srcTexts[i].path, to: compTexts[i].path,
-      text: srcTexts[i].chars, willChange: srcTexts[i].chars !== compTexts[i].chars, nameMatch: same
-    });
+    pairs.push({ from: srcTexts[i].path, to: compTexts[i].path, text: srcTexts[i].chars,
+      willChange: srcTexts[i].chars !== compTexts[i].chars, nameMatch: same });
   }
   if (srcTexts.length !== compTexts.length) {
-    warnings.push("텍스트 노드 수가 다르다 — 원본 " + srcTexts.length + " · 컴포넌트 " + compTexts.length +
-      " ⇒ 짝지은 것은 " + n + "개뿐이고 나머지는 «안 옮긴다»");
+    warnings.push('텍스트 노드 수가 다르다 — 원본 ' + srcTexts.length + ' · 컴포넌트 ' + compTexts.length
+      + ' ⇒ 짝지은 것은 ' + n + '개뿐이고 나머지는 «안 옮긴다»');
   }
   if (nameMismatch) {
-    warnings.push("짝지은 " + nameMismatch + "쌍의 레이어 이름이 다르다 — 순서로 짝지었다(«가정» 이다). textPairs 를 눈으로 볼 것");
+    warnings.push('짝지은 ' + nameMismatch + '쌍의 레이어 이름이 다르다 — 순서로 짝지었다(«가정» 이다). textPairs 를 눈으로 볼 것');
   }
 
-  var fontCheck = { loaded: [], failed: [] };
-  if (copyText && n > 0) {
-    fontCheck = await cttfLoadFontsFor(compTexts);
-    if (fontCheck.failed.length) {
-      warnings.push("글꼴 " + fontCheck.failed.length + "개를 못 불러왔다: " + fontCheck.failed.join(" · ") +
-        " ⇒ 🚫 «아무것도 바꾸지 않았다». 글꼴을 열 수 있게 한 뒤 다시 돌릴 것");
-    }
-  }
-  var fontBlocked = copyText && fontCheck.failed.length > 0;
+  /**
+   * ★★★★ **색이 «몇 군데 다른지» 를 센다 — 옮기든 안 옮기든.**
+   *   전에는 `notCopied` 에 「색은 안 옮긴다」고만 적었다. 그것은 **「안 했다」까지만** 말한다.
+   *   §1-④ 가 요구하는 것은 **「무엇을 남겨 뒀나」** 다 ⇒ 다른 칸 수를 세어 돌려준다.
+   */
+  var srcAll = cttfCollectAll(node);
+  var compByPath = {};
+  cttfCollectAll(target).forEach(function (e) { if (!(e.path in compByPath)) compByPath[e.path] = e; });
+  var fillDiffs = [], fillUnmatched = 0;
+  srcAll.forEach(function (e) {
+    if (!('fills' in e.node)) return;
+    var m = compByPath[e.path];
+    if (!m || m.type !== e.type || !('fills' in m.node)) { fillUnmatched++; return; }
+    if (!cttfSamePaints(e.node.fills, m.node.fills)) fillDiffs.push({ path: e.path, type: e.type });
+  });
 
-  var report = {
-    before: before,
-    component: { id: target.id, name: target.name, key: target.key,
-                 fromSet: component.type === "COMPONENT_SET" ? component.id : null },
-    textPairs: pairs, fonts: fontCheck, warnings: warnings, notCopied: notCopied
-  };
+  return { node: node, target: target, parent: parent, index: index,
+    autoLayoutParent: autoLayoutParent, before: before,
+    srcTexts: srcTexts, compTexts: compTexts, pairs: pairs, warnings: warnings,
+    fillDiffs: fillDiffs, fillUnmatched: fillUnmatched, compByPath: compByPath };
+}
 
-  // ── ① 마른 연습이 기본이다
-  if (dryRun) {
-    report.applied = false;
-    report.dryRun = true;
-    report.hint = "실제로 바꾸려면 dryRun: false 를 «명시» 하십시오. 이번에는 파일을 건드리지 않았습니다";
-    return report;
-  }
-  // ── ② 글꼴이 막히면 «손대지 않고» 멈춘다
-  if (fontBlocked) {
-    report.applied = false;
-    report.dryRun = false;
-    report.stoppedBefore = "글꼴을 못 불러와 멈췄다 — 반쯤 고쳐진 파일을 남기지 않는다";
-    return report;
-  }
-
-  // ── ③ 되돌리기 묶음 열기
-  if (groupUndo && typeof figma.commitUndo === "function") figma.commitUndo();
-
+/** ★ 계획 하나를 실제로 적용한다. 호출하는 쪽이 글꼴을 «이미» 다 불러왔다고 전제한다. */
+async function cttfApplyReplace(plan, opts) {
+  var node = plan.node, parent = plan.parent, before = plan.before;
   var did = { reparented: false, positioned: false, resized: false, layoutCopied: [],
-              textsSet: 0, textsSkipped: 0, textsFailed: [], undoGrouped: false, selected: false };
+    textsSet: 0, textsSkipped: 0, textsFailed: [], fillsSet: 0, fillsFailed: [] };
 
-  var instance = target.createInstance();
-  parent.insertChild(index, instance);
+  var instance = plan.target.createInstance();
+  parent.insertChild(plan.index, instance);
   did.reparented = true;
 
-  if (!autoLayoutParent) {
+  if (!plan.autoLayoutParent) {
     try { instance.x = before.box.x; instance.y = before.box.y; did.positioned = true; } catch (e) {}
-    if (before.constraints && "constraints" in instance) {
-      try { instance.constraints = before.constraints; did.layoutCopied.push("constraints"); } catch (e) {}
+    if (before.constraints && 'constraints' in instance) {
+      try { instance.constraints = before.constraints; did.layoutCopied.push('constraints'); } catch (e) {}
     }
     // ⚠️ 절대좌표 자리에서는 «크기가 자리의 일부» 다. 오토레이아웃 안이면 레이아웃이 정하게 둔다
-    if (before.box.width && before.box.height &&
-        (Math.round(instance.width) !== Math.round(before.box.width) ||
-         Math.round(instance.height) !== Math.round(before.box.height))) {
+    if (before.box.width && before.box.height
+      && (Math.round(instance.width) !== Math.round(before.box.width)
+        || Math.round(instance.height) !== Math.round(before.box.height))) {
       try { instance.resize(before.box.width, before.box.height); did.resized = true; }
-      catch (e) {
-        warnings.push("크기를 못 맞췄다(" + before.box.width + "×" + before.box.height + ") — " + (e && e.message || e));
-      }
+      catch (e) { plan.warnings.push('크기를 못 맞췄다(' + before.box.width + '×' + before.box.height + ') — ' + (e && e.message || e)); }
     }
   } else {
-    warnings.push("부모가 오토레이아웃(" + before.parent.layoutMode + ") 이라 «크기를 맞추지 않았다» — 레이아웃이 정한다");
+    plan.warnings.push('부모가 오토레이아웃(' + before.parent.layoutMode + ') 이라 «크기를 맞추지 않았다» — 레이아웃이 정한다');
   }
 
   Object.keys(before.layout).forEach(function (k) {
     if (!(k in instance)) return;
     try { instance[k] = before.layout[k]; did.layoutCopied.push(k); } catch (e) {}
   });
-  if (keepName) { try { instance.name = before.name; } catch (e) {} }
-  if (before.visible === false) { try { instance.visible = false; did.layoutCopied.push("visible"); } catch (e) {} }
+  if (opts.keepName) { try { instance.name = before.name; } catch (e) {} }
+  if (before.visible === false) { try { instance.visible = false; did.layoutCopied.push('visible'); } catch (e) {} }
 
-  // ── 텍스트 오버라이드
-  if (copyText && n > 0) {
+  if (opts.copyText && plan.pairs.length) {
     var instTexts = cttfCollectTexts(instance);
-    var m = Math.min(srcTexts.length, instTexts.length);
+    var m = Math.min(plan.srcTexts.length, instTexts.length);
     for (var t = 0; t < m; t++) {
-      if (srcTexts[t].chars === instTexts[t].chars) { did.textsSkipped++; continue; }
-      try { await setCharacters(instTexts[t].node, srcTexts[t].chars); did.textsSet++; }
+      if (plan.srcTexts[t].chars === instTexts[t].chars) { did.textsSkipped++; continue; }
+      try { await setCharacters(instTexts[t].node, plan.srcTexts[t].chars); did.textsSet++; }
       catch (e) { did.textsFailed.push({ path: instTexts[t].path, error: String(e && e.message || e) }); }
-    }
-    if (instTexts.length !== compTexts.length) {
-      warnings.push("인스턴스의 텍스트 수(" + instTexts.length + ")가 컴포넌트(" + compTexts.length + ")와 다르다 — 중첩 인스턴스일 수 있다");
     }
   }
 
-  var removedId = node.id, removedName = node.name;
-  node.remove();
+  /**
+   * ⚠️⚠️ 색 옮기기는 **기본이 꺼져 있다.** 켤 수 «없어서» 가 아니라 **켜면 안 되는 쪽이 기본**이라서다 —
+   *   컴포넌트화의 뜻이 「모양을 한 군데서 정한다」인데, 색을 자리마다 베껴 오면
+   *   **없애려던 드리프트를 오버라이드로 «보존»** 한다. 자리마다 색이 뜻을 가지면 그건 **변형(variant)** 이다.
+   *   ⇒ 켜고 싶으면 사람이 `copyFills: true` 라고 말한다. 끄고 있을 때도 **몇 군데 다른지는 센다.**
+   */
+  if (opts.copyFills && plan.fillDiffs.length) {
+    var instByPath = {};
+    cttfCollectAll(instance).forEach(function (e) { if (!(e.path in instByPath)) instByPath[e.path] = e; });
+    plan.fillDiffs.forEach(function (d) {
+      var src = plan.compByPath[d.path];       // 짝이 있다는 것은 계획에서 확인됐다
+      var dst = instByPath[d.path];
+      var from = null;
+      cttfCollectAll(node).some(function (e) { if (e.path === d.path) { from = e; return true; } return false; });
+      if (!dst || !from || !('fills' in dst.node)) { did.fillsFailed.push({ path: d.path, error: '인스턴스에서 짝을 못 찾았다' }); return; }
+      try { dst.node.fills = from.node.fills; did.fillsSet++; }
+      catch (e) { did.fillsFailed.push({ path: d.path, error: String(e && e.message || e) }); }
+    });
+  }
 
-  if (groupUndo && typeof figma.commitUndo === "function") { figma.commitUndo(); did.undoGrouped = true; }
-  try { figma.currentPage.selection = [instance]; did.selected = true; } catch (e) {}
+  var removed = { id: node.id, name: node.name };
+  node.remove();                                // ★ «넣고 나서» 뺀다 — GROUP 이 통째로 사라지지 않게
+  return { instanceId: instance.id, instanceName: instance.name, removed: removed, did: did };
+}
 
-  report.applied = true;
+/**
+ * ★★★★★ 한 자리 — 또는 **여러 자리** — 를 컴포넌트 인스턴스로 갈아치운다 (2026-11-25 묶음 지원)
+ *
+ *   되풀이 컴포넌트화의 «마지막 한 걸음» 이다. 전에는 낱개 넷을 이어야 했다 —
+ *   인스턴스 만들기 → 그 부모의 그 index 에 넣기 → 텍스트 오버라이드 → 원본 삭제.
+ *
+ * ⚠️⚠️ 이 명령은 «노드를 지운다». 규율 다섯:
+ *   ① **기본이 «마른 연습»(`dryRun`)** — 바꾸려면 `dryRun: false` 를 «명시» 해야 한다.
+ *      마른 연습도 조용하지 않다 — `applied: false` 를 또렷이 돌려준다.
+ *   ② **글꼴을 손대기 «전» 에 다 불러온다** — 실패하면 «아무것도 바꾸지 않고» 멈춘다.
+ *      ★ 묶음에서 더 중요하다: 300자리 중 150번째에서 터지면 반쯤 고쳐진 파일이 남는다.
+ *   ③ **`figma.commitUndo()` 로 묶음 «전체» 를 싼다** — 300자리를 갈아도 **Cmd+Z 한 번**이다.
+ *      ★ 트랜잭션이 없는 곳에서 이것이 **되돌리기의 유일한 수단**이다.
+ *   ④ **한 자리가 터져도 멈추지 않고 세어서 보고한다** — 그리고 ③ 덕분에 사람이 통째로 무를 수 있다.
+ *   ⑤ **못 옮긴 것을 «세어» 돌려준다** — 「색은 안 옮긴다」가 아니라 **「색이 N군데 다르다」** 다.
+ */
+async function replaceWithInstance(params) {
+  var p = params || {};
+  var ids = [];
+  if (Array.isArray(p.nodeIds)) ids = p.nodeIds.slice();
+  if (p.nodeId) ids.unshift(p.nodeId);
+  ids = ids.filter(function (v, i) { return v && ids.indexOf(v) === i; });   // 중복 제거
+  if (!ids.length) throw new Error('nodeId 나 nodeIds 중 하나는 있어야 한다');
+  if (!p.componentId && !p.componentKey) throw new Error('componentId 나 componentKey 중 하나는 있어야 한다');
+
+  var opts = {
+    dryRun: p.dryRun !== false,              // ★ 기본 true
+    copyText: p.copyText !== false,
+    copyFills: p.copyFills === true,         // ★ 기본 false — 위 ⑤ 머리말
+    keepName: p.keepName === true,
+    groupUndo: p.groupUndo !== false
+  };
+
+  // ── 컴포넌트 찾기
+  var component = null;
+  if (p.componentId) {
+    component = await getNodeByIdSafe(p.componentId);
+    if (!component) throw new Error('Component not found with ID: ' + p.componentId);
+  } else {
+    try { component = await figma.importComponentByKeyAsync(p.componentKey); }
+    catch (e) {
+      throw new Error('componentKey 로 못 찾았다(' + p.componentKey + ') — 아직 publish 안 된 로컬 컴포넌트면 «componentId» 를 쓸 것: ' + (e && e.message || e));
+    }
+  }
+  var target = component;
+  if (component.type === 'COMPONENT_SET') {
+    target = component.defaultVariant;
+    if (!target) throw new Error('COMPONENT_SET 인데 defaultVariant 가 없다 — 어느 변형인지 정해 줄 것');
+  }
+  if (target.type !== 'COMPONENT') throw new Error('컴포넌트가 아니다: ' + target.type);
+
+  // ── 자리마다 계획을 낸다 (아무것도 안 바꾼다)
+  var sites = [], plans = [];
+  for (var i = 0; i < ids.length; i++) {
+    var id = ids[i], node = null, err = null;
+    try { node = await getNodeByIdSafe(id); } catch (e) { err = String(e && e.message || e); }
+    if (!node) { sites.push({ nodeId: id, ok: false, error: err || 'Node not found with ID: ' + id }); plans.push(null); continue; }
+    if (node.type === 'COMPONENT' || node.type === 'COMPONENT_SET') {
+      sites.push({ nodeId: id, name: node.name, ok: false,
+        error: '컴포넌트 «정의» 는 갈아치우지 않는다 (' + node.type + ') — 정의가 곧 원본이다' });
+      plans.push(null); continue;
+    }
+    if (node === target) {
+      sites.push({ nodeId: id, name: node.name, ok: false, error: '자기 자신으로 갈아치울 수 없다' });
+      plans.push(null); continue;
+    }
+    var parent = node.parent;
+    if (!parent || !('insertChild' in parent)) {
+      sites.push({ nodeId: id, name: node.name, ok: false,
+        error: '부모가 자식을 받지 못한다 — 갈아치울 «자리» 가 없다: ' + (parent ? parent.type : '(부모 없음)') });
+      plans.push(null); continue;
+    }
+    var plan = cttfPlanReplace(node, target);
+    plans.push(plan);
+    sites.push({ nodeId: id, name: node.name, ok: true, before: plan.before,
+      textPairs: plan.pairs, fillsDiffer: plan.fillDiffs.length,
+      fillPathsUnmatched: plan.fillUnmatched, warnings: plan.warnings });
+  }
+
+  // ── ② 글꼴을 «먼저» 다 불러온다. 자리가 몇이든 컴포넌트는 하나라 한 번이면 된다
+  var fontCheck = { loaded: [], failed: [] };
+  var anyText = plans.some(function (pl) { return pl && pl.pairs.length; });
+  if (opts.copyText && anyText) {
+    fontCheck = await cttfLoadFontsFor(cttfCollectTexts(target));
+  }
+  var planned = plans.filter(Boolean).length;
+  var report = {
+    component: { id: target.id, name: target.name, key: target.key,
+      fromSet: component.type === 'COMPONENT_SET' ? component.id : null },
+    sites: sites,
+    fonts: fontCheck,
+    notCopied: ['이미지 fill', '가시성(visible) 오버라이드', '변형(variant) 선택', '효과(effects)']
+      .concat(opts.copyFills ? [] : ['색(fills) — ★ «끄는 것이 기본» 이다(머리말 ⑤). 다른 칸 수는 sites[].fillsDiffer 에 있다']),
+    totals: { 자리: ids.length, 계획됨: planned, 못함: ids.length - planned,
+      색다름: sites.reduce(function (a, s) { return a + (s.fillsDiffer || 0); }, 0) }
+  };
+
+  if (fontCheck.failed.length) {
+    report.applied = false;
+    report.dryRun = opts.dryRun;
+    report.stoppedBefore = '글꼴 ' + fontCheck.failed.length + '개를 못 불러왔다(' + fontCheck.failed.join(' · ')
+      + ') — 🚫 «아무것도 바꾸지 않았다». 반쯤 고쳐진 파일을 남기지 않는다';
+    return report;
+  }
+  if (opts.dryRun) {
+    report.applied = false;
+    report.dryRun = true;
+    report.hint = '실제로 바꾸려면 dryRun: false 를 «명시» 하십시오. 이번에는 파일을 건드리지 않았습니다';
+    return report;
+  }
+  if (!planned) {
+    report.applied = false;
+    report.dryRun = false;
+    report.stoppedBefore = '갈아치울 수 있는 자리가 하나도 없다 — sites[].error 를 볼 것';
+    return report;
+  }
+
+  // ── ③ 되돌리기 묶음을 «전체» 에 두른다
+  if (opts.groupUndo && typeof figma.commitUndo === 'function') figma.commitUndo();
+
+  var done = 0, failed = 0, textsSet = 0, fillsSet = 0;
+  for (var k = 0; k < plans.length; k++) {
+    if (!plans[k]) continue;
+    try {
+      var r = await cttfApplyReplace(plans[k], opts);
+      sites[k].instanceId = r.instanceId;
+      sites[k].instanceName = r.instanceName;
+      sites[k].removed = r.removed;
+      sites[k].did = r.did;
+      sites[k].warnings = plans[k].warnings;      // 적용 중에 붙은 것까지
+      textsSet += r.did.textsSet; fillsSet += r.did.fillsSet;
+      done++;
+    } catch (e) {
+      // ④ 멈추지 않는다 — 세어서 보고하고, ③ 덕분에 사람이 통째로 무를 수 있다
+      sites[k].ok = false;
+      sites[k].error = '적용 중 터졌다: ' + String(e && e.message || e);
+      failed++;
+    }
+  }
+
+  var undoGrouped = false;
+  if (opts.groupUndo && typeof figma.commitUndo === 'function') { figma.commitUndo(); undoGrouped = true; }
+
+  report.applied = done > 0;
   report.dryRun = false;
-  report.instanceId = instance.id;
-  report.instanceName = instance.name;
-  report.removed = { id: removedId, name: removedName };
-  report.did = did;
-  report.warnings = warnings;
+  report.totals.바꿨음 = done;
+  report.totals.적용중실패 = failed;
+  report.totals.텍스트넣음 = textsSet;
+  report.totals.색넣음 = fillsSet;
+  report.totals.undoGrouped = undoGrouped;
+  if (failed) {
+    report.hint = '★ ' + failed + '자리가 적용 중 터졌다. undo 가 «한 묶음» 이므로 Cmd+Z 한 번으로 '
+      + done + '자리를 통째로 무를 수 있다 — sites[].error 를 먼저 읽을 것';
+  }
   return report;
 }

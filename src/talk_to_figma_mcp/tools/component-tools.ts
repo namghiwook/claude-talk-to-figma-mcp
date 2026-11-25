@@ -336,29 +336,31 @@ export function registerComponentTools(server: McpServer): void {
     }
   );
 
-  // ★★ Replace a node with a component instance — the last step of componentizing repeats
+  // ★★ Replace one node — or MANY — with component instances (the last step of componentizing repeats)
   server.tool(
     "replace_with_instance",
-    "Replace an existing node IN PLACE with an instance of a component: keeps the same parent and child index, carries over position/constraints (or auto-layout sizing), copies TEXT overrides, deletes the original, and groups it all into ONE undo step. DESTRUCTIVE — it removes the original node. Defaults to dryRun:true, which changes nothing and returns the plan; you must pass dryRun:false explicitly to apply. Fonts are loaded BEFORE any change, so a font failure leaves the file untouched instead of half-edited. Only TEXT overrides are carried over — colors, images, visibility, variant choice and effects are NOT (see notCopied in the result).",
+    "Replace existing node(s) IN PLACE with instances of a component: keeps each node's parent and child index, carries over position/constraints (or leaves size to auto-layout), copies TEXT overrides, deletes the original, and groups the WHOLE batch into ONE undo step. DESTRUCTIVE — it removes the original nodes. Defaults to dryRun:true, which changes nothing and returns the plan per site; you must pass dryRun:false explicitly to apply. Fonts load BEFORE any change, so a font failure leaves the file untouched instead of half-edited. Pass nodeIds to do several sites in one call — one Cmd+Z then reverts all of them, which is the only rollback available since Figma has no transactions. Colors are NOT copied by default and that is deliberate: copying them back would preserve the very drift componentizing removes (per-site color that carries meaning belongs in a variant). It still COUNTS how many nodes differ, per site, in fillsDiffer.",
     {
-      nodeId: z.string().describe("ID of the node to replace (the repeat site). Must not be a COMPONENT/COMPONENT_SET definition."),
+      nodeId: z.string().optional().describe("ID of a single node to replace. Must not be a COMPONENT/COMPONENT_SET definition."),
+      nodeIds: z.array(z.string()).optional().describe("IDs of several nodes to replace in one call. Combined with nodeId if both are given; duplicates are dropped. One undo step covers the whole batch."),
       componentId: z.string().optional().describe("ID of the COMPONENT (or COMPONENT_SET, which uses its defaultVariant). Prefer this for local, unpublished components."),
       componentKey: z.string().optional().describe("Component key, imported via importComponentByKeyAsync. Only works for published components — use componentId otherwise."),
-      dryRun: z.boolean().optional().default(true).describe("TRUE (default): change nothing, return the plan, the text pairing and the warnings. Pass false to actually apply."),
-      copyText: z.boolean().optional().default(true).describe("Carry over TEXT content from the original into the instance as overrides, paired by document order."),
-      keepName: z.boolean().optional().describe("Keep the original layer name on the instance instead of the component name."),
-      groupUndo: z.boolean().optional().default(true).describe("Wrap the change with figma.commitUndo() so one Cmd+Z reverts the whole replacement."),
+      dryRun: z.boolean().optional().default(true).describe("TRUE (default): change nothing, return the per-site plan, the text pairing, how many fills differ, and the warnings. Pass false to actually apply."),
+      copyText: z.boolean().optional().default(true).describe("Carry over TEXT content from each original into its instance as overrides, paired by document order."),
+      copyFills: z.boolean().optional().default(false).describe("FALSE (default, deliberate): do not copy fills, only count the differences. Pass true to carry per-node fills over as overrides, matched by layer path — use it only when the per-site color is meaningful and a variant is not wanted."),
+      keepName: z.boolean().optional().describe("Keep each original layer name on its instance instead of the component name."),
+      groupUndo: z.boolean().optional().default(true).describe("Wrap the whole batch with figma.commitUndo() so one Cmd+Z reverts every replacement in the call."),
     },
-    async ({ nodeId, componentId, componentKey, dryRun, copyText, keepName, groupUndo }) => {
+    async ({ nodeId, nodeIds, componentId, componentKey, dryRun, copyText, copyFills, keepName, groupUndo }) => {
       try {
+        if (!nodeId && !(nodeIds && nodeIds.length)) {
+          return { content: [{ type: "text", text: "❌ Need nodeId or nodeIds" }], isError: true };
+        }
         if (!componentId && !componentKey) {
-          return {
-            content: [{ type: "text", text: "❌ Need componentId or componentKey" }],
-            isError: true,
-          };
+          return { content: [{ type: "text", text: "❌ Need componentId or componentKey" }], isError: true };
         }
         const result = await sendCommandToFigma("replace_with_instance", {
-          nodeId, componentId, componentKey, dryRun, copyText, keepName, groupUndo,
+          nodeId, nodeIds, componentId, componentKey, dryRun, copyText, copyFills, keepName, groupUndo,
         });
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
       } catch (error) {
