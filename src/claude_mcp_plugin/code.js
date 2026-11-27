@@ -4884,15 +4884,47 @@ async function convertToFrame(params) {
   if ("rotation" in node) frame.rotation = node.rotation;
   if ("clipsContent" in node) frame.clipsContent = node.clipsContent;
 
-  // Transfer children if the node has them (e.g., groups)
+  /**
+   * ★★★★★ **자식의 «절대» 자리를 지킨다** (2026-11-26 실측으로 걸렸다)
+   *
+   *   ⚠️⚠️ `appendChild` 는 자식의 `x`/`y` 를 **숫자 그대로 둔다** — 그런데 그 수의 «뜻» 이 바뀐다.
+   *   GROUP 의 자식 좌표는 **그룹의 부모 기준** 인데, FRAME 에 넣으면 **프레임 기준** 으로 읽힌다.
+   *   ⇒ 자식이 **프레임의 지역 좌표만큼 밀린다.**
+   *
+   *   ✅ 쟀다 — `tools/geometry-diff.mjs` 가 «첫 실행에» 잡았다:
+   *     ⓐ 페이지 원점의 그룹: 자식이 `(20,260) → (40,520)` **260.8px** 옮겨졌다
+   *     ⓑ `(300,200)` 안의 그룹: 자식이 `(340,230) → (380,260)` **50px**(= 그룹의 지역 좌표 40,30)
+   *   🚫 그런데 `STR-002` 소견은 **사라지고** 검사기는 **PASS** 다 —
+   *     「열쇠가 사라졌다」가 「좋아졌다」가 아닌 바로 그 꼴이다.
+   *
+   *   ★ 프레임 «자신» 은 안 틀어진다 — 의심했는데 **재서 거뒀다**(`340,230` → `340,230`).
+   *     결함은 **자식뿐** 이다.
+   *   ⚠️ 회전된 노드에서는 `absoluteTransform` 의 이동 성분만 쓰므로 **어긋날 수 있다** —
+   *     그 경우는 **안 쟀다.**
+   */
   let childCount = 0;
+  let pendingKids = null, pendingWant = null;
   const isGroup = node.type === "GROUP";
   if ("children" in node) {
     const children = [...node.children];
     childCount = children.length;
+    // ★ 옮기기 «전에» 절대 자리를 적어 둔다
+    const want = children.map(function (c) {
+      const t = ("absoluteTransform" in c) ? c.absoluteTransform : null;
+      return t ? { ax: t[0][2], ay: t[1][2] } : null;
+    });
     for (const child of children) {
       frame.appendChild(child);
     }
+    /**
+     * ⚠️⚠️ 보정은 **프레임을 부모에 넣은 «뒤»** 다 — 아래 `insertChild` 다음.
+     *   `figma.createFrame()` 은 프레임을 **현재 페이지** 에 붙인다. 그 자리에서
+     *   `absoluteTransform` 을 읽으면 **프레임이 아직 제자리가 아니다** ⇒ 보정이 틀린다.
+     *   ✅ 2026-11-26 에 시험이 그것을 잡았다(`(340,230)` 이 `(640,430)` 이 됐다).
+     *   ★ 「고침도 가설이다」 — 흉내 노드로 돌려 보고 알았다.
+     */
+    pendingKids = children;
+    pendingWant = want;
   }
 
   // Groups auto-delete when all children are moved out, so check if node still exists
@@ -4910,6 +4942,22 @@ async function convertToFrame(params) {
   // If the group was auto-deleted, originalIndex may be stale — recalculate
   const insertIndex = nodeStillExists ? originalIndex : Math.min(originalIndex, parent.children.length);
   parent.insertChild(insertIndex, frame);
+
+  /**
+   * ★★ 이제 프레임이 제자리다 ⇒ 자식의 «절대» 자리를 되돌린다.
+   *   ⚠️ 못 읽으면 **건드리지 않는다** — 틀린 보정은 안 하는 것보다 나쁘다.
+   */
+  if (pendingKids) {
+    const ft = ("absoluteTransform" in frame) ? frame.absoluteTransform : null;
+    if (ft) {
+      for (let i = 0; i < pendingKids.length; i++) {
+        const c = pendingKids[i], w = pendingWant[i];
+        if (!w || !("x" in c) || !("y" in c)) continue;
+        c.x = w.ax - ft[0][2];
+        c.y = w.ay - ft[1][2];
+      }
+    }
+  }
 
   // Remove the original node if it still exists
   if (nodeStillExists) {
