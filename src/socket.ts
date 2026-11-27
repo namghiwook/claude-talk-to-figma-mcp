@@ -1,4 +1,5 @@
 import { Server, ServerWebSocket } from "bun";
+import { summarizeLive } from "./socket-status";
 
 // Enhanced logging system
 const logger = {
@@ -507,7 +508,9 @@ function handleConnection(ws: ServerWebSocket<any>) {
 // ─── Server ────────────────────────────────────────────────────────────────
 
 const server = Bun.serve({
-  port: 3055,
+  // ★ 기본값은 3055 그대로. 버릴 서버를 딴 포트에 띄워 «돌아가는 것을 안 건드리고»
+  //   재 보려고 환경변수만 열어 둔다.
+  port: Number(process.env.CTTF_PORT) || 3055,
   // uncomment this to allow connections in windows wsl
   // hostname: "0.0.0.0",
   fetch(req: Request, server: Server) {
@@ -532,6 +535,8 @@ const server = Bun.serve({
         status: "running",
         uptime: process.uptime(),
         stats,
+        // ★ 지금 살아 있는 채널 + 보낼 수 있는 채널
+        ...summarizeLive(channels, pluginClients, agentClients),
         queue: {
           channels: Array.from(channelQueues.entries()).map(([name, state]) => ({
             channel: name,
